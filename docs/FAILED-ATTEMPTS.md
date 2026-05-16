@@ -131,3 +131,38 @@ This document records every model, framework, and optimisation we tried that did
 - Pi 5 ships with NVMe at PCIe Gen 2 (700 MB/s); forcing Gen 3 doubles raw throughput.
 - Only affects model load time, not inference throughput (mmap warms the page cache after first run).
 - Not applied.
+
+### IPv6 disable + EEVDF scheduler tuning -- NEUTRAL
+
+- `net.ipv6.conf.{all,default,lo}.disable_ipv6 = 1`.
+- `/sys/kernel/debug/sched/migration_cost_ns = 5000000` (default 500000).
+- `/sys/kernel/debug/sched/base_slice_ns = 8400000` (default 2100000).
+- Hypothesis: reduce thread migration and increase scheduling quantum to keep dllama threads on the same core longer.
+- Measured: 13.795 tok/s mean (n=20, 95% CI +/- 0.047) vs prior baseline 13.82.
+- Delta: -0.18%, within statistical noise.
+- Conclusion: scheduler is not the bottleneck. The hot path is memory-bandwidth + network-sync; scheduler quanta are already long enough.
+- Left applied for cleanliness (zero downside) and persisted in `systemd/eevdf-tuning.service` + `sysctl/99-dllama-no-ipv6.conf`.
+
+### Jumbo frames MTU 9000 -- BLOCKED BY LIVE LINK
+
+- bcmgenet driver returns `RTNETLINK answers: Device or resource busy` when setting MTU on an interface that is UP and carrying TCP connections.
+- Workaround: `ip link set eth0 down`, then change MTU, then up -- kills SSH and the dllama worker connection on that node.
+- Alternative: persistent config in `/etc/network/interfaces.d` and reboot -- excluded by operator (production cluster).
+- NIC `maxmtu = 10222` confirms the hardware supports it; the limitation is purely operational (cannot hot-swap).
+- Estimated gain (community-documented): 3-8% on prediction phase.
+- Document as a candidate optimisation for next reboot.
+
+### TCP socket buffer bump -- ALREADY OPTIMAL
+
+- Kernel: `rmem_max = wmem_max = 128 MB`, `tcp_rmem/wmem max = 128 MB`.
+- dllama explicitly sets `SO_RCVBUF = SO_SNDBUF = 16 MB` per socket via the network patches.
+- Verified with `ss -tm` on live worker sockets: `rb16777216 tb16777216` confirms the 16 MB allocation.
+- No further bump beneficial.
+
+### `madvise(MADV_HUGEPAGE)` on mmap'd model weights -- KERNEL HAS NO THP
+
+- Raspberry Pi OS kernel 6.12 ships with `# CONFIG_TRANSPARENT_HUGEPAGE is not set` (verified in `/boot/config-$(uname -r)`).
+- `/sys/kernel/mm/transparent_hugepage/enabled` does not exist on this kernel.
+- `MADV_HUGEPAGE` would be a no-op without a kernel rebuild.
+- Without huge pages, 9.5 GB of mmap'd weights require ~2.5 million 4 KB TLB entries; ARM Cortex-A76 has 1024 L2 TLB entries -> TLB miss rate dominates.
+- Kernel rebuild excluded by operational policy (production cluster, no reboot window).
