@@ -159,6 +159,30 @@ This document records every model, framework, and optimisation we tried that did
 - Verified with `ss -tm` on live worker sockets: `rb16777216 tb16777216` confirms the 16 MB allocation.
 - No further bump beneficial.
 
+### isolcpus=2,3 + `taskset -c 2,3` + `--nthreads 2` -- HANGS ALL-REDUCE
+
+- Cold boot with `isolcpus=2,3 irqaffinity=0,1 nohz_full=2,3 rcu_nocbs=2,3` in `/boot/firmware/cmdline.txt`.
+- systemd units rewritten to `ExecStart=/usr/bin/taskset -c 2,3 ... --nthreads 2`.
+- Idea: dedicate cores 2,3 to dllama compute, leave 0,1 for kernel/IRQs/Docker monitoring.
+- Observed: dllama-api accepted the request, started generation, then process went into uninterruptible sleep (`D` state in `ps`) and stopped listening on :9999.
+- Workers (also pinned to cores 2,3 with `--nthreads 2`) showed the same hang.
+- Root cause: dllama's all-reduce protocol is sensitive to the thread topology agreed at startup. Halving threads + restricting to non-default cores desynchronised the sync barrier between nodes; the read loop on `NnNetworkNodeSynchronizer::sync()` blocks forever waiting for bytes that never arrive in the expected layout.
+- Same failure class as PGO: the all-reduce timing is the most fragile part of dllama on a CPU cluster.
+- Reverted via `cp /boot/firmware/cmdline.txt.pre-isolcpus /boot/firmware/cmdline.txt` and restoring the `.bak` systemd units, then cold reboot of all 4 nodes.
+- Post-rollback baseline restored to 13.65-13.82 tok/s (within noise).
+- Lesson: do not change `--nthreads` or core pinning without a matching upstream patch to the all-reduce loop. Stick to `--nthreads 4` and let the scheduler manage placement.
+
+### MTU 9000 jumbo frames on Pi 5 / bcmgenet -- DRIVER DOES NOT APPLY MTU AT BOOT
+
+- Wrote `mtu: 9000` to the netplan-generated NetworkManager profile (`nmcli connection modify netplan-eth0 ethernet.mtu 9000`).
+- Cold-booted: `eth0` came up at MTU 1500 despite the profile.
+- `nmcli connection up` after boot also did not apply the change.
+- `ip link set eth0 mtu 9000` returned `RTNETLINK answers: Device or resource busy` while link is UP (consistent across reboots).
+- The only known reliable way to change MTU on bcmgenet (Pi 5) is `ip link set eth0 down ; ip link set eth0 mtu 9000 ; ip link set eth0 up`, which kills the live SSH session that is using eth0.
+- Attempted via `sudo nohup` background script; the SSH disconnect appears to have killed the script mid-execution, leaving one node (rpi-1006) unreachable until a physical power cycle. wlan0 was also dropped from the AP.
+- Lesson: do not attempt link-down operations remotely on a node whose management plane shares the same NIC, unless a fallback management path (out-of-band, IPMI) is available.
+- The optimisation remains theoretically applicable but requires either an OOB management channel or accepting downtime for an interface-bounce on each node.
+
 ### `madvise(MADV_HUGEPAGE)` on mmap'd model weights -- KERNEL HAS NO THP
 
 - Raspberry Pi OS kernel 6.12 ships with `# CONFIG_TRANSPARENT_HUGEPAGE is not set` (verified in `/boot/config-$(uname -r)`).
