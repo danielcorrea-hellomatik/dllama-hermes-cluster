@@ -1,4 +1,12 @@
-# Distributed LLM Inference Cluster — 4x Raspberry Pi 5
+# Distributed LLM Inference Cluster — 4x Raspberry Pi 5 (archived)
+
+> **This repository has moved.** All current work, code, deployment files, paper and documentation now live in a single consolidated fork of `distributed-llama`:
+>
+> **→ https://github.com/danielcorrea-hellomatik/distributed-llama (branch `pi5-cluster`)**
+>
+> This wrapper repo is preserved for historical reference only and is no longer maintained.
+
+---
 
 Production-grade distributed inference cluster running **Qwen3-30B-A3B (Mixture of Experts)** at **13.82 tokens/second sustained** on 4x Raspberry Pi 5 16GB. Built on a patched fork of `distributed-llama` v0.16.5 with 9 source-level fixes, exposed as an OpenAI-compatible HTTP API, and integrated with Hermes Agent for autonomous workflows.
 
