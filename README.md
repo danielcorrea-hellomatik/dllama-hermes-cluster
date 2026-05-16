@@ -36,6 +36,91 @@ Baseline (Llama 3.1 8B dense, vanilla):    5.70 tok/s
 
 ---
 
+## Optimisation journey -- what we changed and why
+
+This section summarises the chronological set of optimisations applied, what worked, what was reverted, and the measured impact of each.
+
+### Stage 1 -- Operating system baseline (5.70 -> 6.85 tok/s, +20%)
+
+The default Raspberry Pi OS configuration is not tuned for sustained-CPU workloads. We changed:
+
+- `cpufreq` governor from `ondemand` to `performance` on all four cores of every node. The governor is set at boot through a dedicated systemd unit ([systemd/cpu-performance.service](systemd/cpu-performance.service)).
+- TCP congestion control switched to `bbr` (kernel default `cubic` is conservative for short-lived bursts).
+- Swap moved to a 16 GB file on the NVMe drive on the root node and 4 GB on workers; default Pi OS uses `zram` which competes with the inference workload for CPU.
+- `jemalloc 2` preloaded into both `dllama-api` and `dllama-worker` via systemd `LD_PRELOAD` (allocator with better arena locality than glibc malloc).
+- `mlock` enabled on the inference processes (`LimitMEMLOCK=infinity`) so the loaded model cannot be paged out under memory pressure.
+
+### Stage 2 -- Patching the framework (6.85 -> 7.18 tok/s, +5%)
+
+While running the cluster we found several bugs in `distributed-llama` v0.16.5 that either crashed the daemon or wasted CPU. Eight source-level fixes were applied (see the table below). The two most important are:
+
+- **uint8 overflow on `nBatches`** -- setting `nbatches=256` silently became `0` because of a `NnByte` field; this triggered an embedding-layer assertion. Promoting to `NnUint` enables larger batch sizes.
+- **`finish_reason` empty string** -- the dllama HTTP response emitted `"finish_reason": ""`, which strict OpenAI clients (Hermes Agent) interpret as an in-progress stream and retry indefinitely. Forcing `"stop"` or `"length"` fixes the integration.
+
+### Stage 3 -- Removing parasitic load (transient regression, restored to 7.01)
+
+The benchmark exposed a `llama.cpp/build/bin/rpc-server` orphan process running on each worker since a previous (manual) test, consuming 1.9 GB of RAM each (5.7 GB cluster-wide). After killing it and forcing a full `swapoff -a && swapon -a` cycle, the cluster ran with 0 B swap consumption and 9.4 GB free per worker.
+
+We also masked five unrelated systemd timers (`apt-daily`, `apt-daily-upgrade`, `man-db`, `e2scrub_all`, `rpi-zram-writeback`) that would otherwise inject I/O spikes mid-inference.
+
+### Stage 4 -- The model change (7.01 -> 11.40 tok/s, +63%)
+
+By far the largest single improvement came from switching the served model from **Llama 3.1 8B (dense, Q40)** to **Qwen3-30B-A3B (Mixture of Experts, Q40)**. While the total parameter count grew from 8 B to 30 B, the MoE architecture only activates 8 of 128 experts per token, so the effective per-token weight footprint dropped from ~5 GB to ~3 GB. Memory bandwidth is the binding constraint on Pi 5 (17 GB/s LPDDR4X), so reducing the per-token weight load directly increased throughput.
+
+This is, conceptually, "streaming the weights" -- but implemented at the model architecture level rather than via software-level NVMe paging (which would be 24x slower than RAM and produce the opposite effect).
+
+### Stage 5 -- Right-sizing the KV cache (11.40 -> 12.71 tok/s, +11%)
+
+We initially configured `--max-seq-len 65536` to satisfy the Hermes Agent context-length check. This allocated more KV cache than fit in RAM and pushed the root node into swap. Reducing to `--max-seq-len 32768` (Qwen3-30B-A3B's native context) keeps everything in RAM, and we override Hermes's check by setting `context_length: 65536` in `~/.hermes/config.yaml`.
+
+### Stage 6 -- Network syscall tuning (12.71 -> 13.34 tok/s, +5%)
+
+Three socket options added to `setSocketBuffers()` in `nn-network.cpp` (patch 9):
+
+- `SO_BUSY_POLL = 50` (microseconds) -- the kernel busy-spins for up to 50 us inside `recv()` before yielding the thread. For our 0.226 ms LAN round-trip, this saves the scheduler wakeup cost on the receive path. Measured as the largest contributor of the three.
+- `SO_PRIORITY = 6` -- raises the traffic-control class of dllama packets to "interactive", reducing queue delay on the NIC under any background traffic.
+- `SO_INCOMING_CPU = -1` -- hint to the kernel to deliver incoming packets to the CPU that last touched the socket, improving L1/L2 cache locality of the recv path.
+
+### Stage 7 -- ARM-specific compiler flags (13.34 -> 13.82 tok/s, +4%)
+
+We discovered that `objdump -d dllama | grep -cE 'udot|sdot'` returned **zero** -- the binary was not using NEON dot-product instructions despite the Cortex-A76 supporting them. The default `-march=native` enables the baseline ARMv8-A profile but not the optional `+dotprod` extension. After adding to the Makefile:
+
+```
+-mcpu=cortex-a76 -mtune=cortex-a76
+-march=armv8.2-a+fp16+dotprod+rcpc
+-fipa-pta -fipa-icf
+-falign-functions=64 -falign-loops=64
+```
+
+The recompiled binary contained **322 `udot/sdot` instructions**. Each contributes 2-4 ops/cycle on Cortex-A76, accelerating the Q40 GEMM kernels at the heart of inference.
+
+### Stage 8 -- NIC interrupt coalescing (no measurable gain)
+
+`ethtool -C eth0 rx-usecs 10 tx-usecs 10` (down from the default 49) reduces the interrupt coalescing window. On our 0.226 ms LAN this was within the measurement noise (CV 0.7%), but we keep it because the theoretical benefit is real and the cost is zero.
+
+### What we tried and reverted
+
+| Attempt                                              | Result                                              | Reverted? |
+| ---------------------------------------------------- | --------------------------------------------------- | --------- |
+| MSG_ZEROCOPY in writeMany for sends >= 32 KB         | -0.9% (kernel falls back to copy without ERRQUEUE)  | Yes       |
+| TCP_QUICKACK persistent (re-arm on every recv)       | -0.9% (extra syscall outweighs delayed-ACK savings) | Yes       |
+| Profile-Guided Optimisation (PGO)                    | Crash on first request (instrumentation breaks all-reduce timing) | Yes |
+| nthreads > 4                                          | dllama hard-limit; refuses to start                 | --        |
+| EXO framework                                         | Requires Apple MLX (Metal GPU); not buildable on ARM Linux | -- |
+| prima.cpp (HALO author's earlier project)             | ZMQ topology negotiation hangs on Pi 5              | --        |
+| llama.cpp + RPC                                       | 25x regression vs single-node (per Jeff Geerling)    | --        |
+| Llama 3.3 70B Q40                                     | 38 GB does not fit -- swap thrashing at 0.15 tok/s  | --        |
+
+All rejected configurations are documented in detail in [`docs/FAILED-ATTEMPTS.md`](docs/FAILED-ATTEMPTS.md).
+
+### Research process
+
+The optimisations above are not guesses. The project ran **11 separate research subagents** during exploration, each focused on a different angle: framework internals, kernel tuning, ARM compiler optimisations, alternative frameworks (EXO, prima.cpp, MNN-LLM, Cake, mistral.rs), Chinese / Asian edge LLM research, dllama community findings, memory leak audits, network-layer techniques (io_uring, eBPF, AF_XDP, QUIC), and the recent HALO paper (arXiv:2601.11676). The consolidated findings are recorded in [`docs/SUBAGENT-RESEARCH.md`](docs/SUBAGENT-RESEARCH.md).
+
+The key insight from this research: **our 13.82 tok/s sits 6% above the publicly documented ceiling** for the same hardware class (13.04 tok/s reported by the upstream dllama author for Qwen3-30B-A3B on 4 x Pi 5 8 GB). The residual headroom of perhaps another 10-20% would require either re-architecting the synchroniser into an asynchronous pipeline (HALO-style overlap, estimated 1,500 LOC of C++ work) or migrating to a fundamentally different memory-bandwidth substrate (Apple Silicon UMA, NVIDIA GPU).
+
+---
+
 ## Architecture overview
 
 ```mermaid
@@ -315,3 +400,28 @@ The full technical report (11 pages, 13 references, 7 figures) is in [`paper/mai
 MIT. See [`LICENSE`](LICENSE).
 
 The patches in `patches/` are also MIT-licensed and may be submitted upstream to `b4rtaz/distributed-llama` if desired.
+
+---
+
+## Acknowledgements
+
+- [b4rtaz/distributed-llama](https://github.com/b4rtaz/distributed-llama) by Bartlomiej Tadych -- the framework we built on top of, MIT licensed.
+- [Qwen team at Alibaba](https://huggingface.co/Qwen) for the Qwen3-30B-A3B MoE model and the published Pi cluster benchmark in [discussion #255](https://github.com/b4rtaz/distributed-llama/discussions/255).
+- [Jeff Geerling](https://www.jeffgeerling.com) for the rigorous Pi cluster benchmark documentation that saved us weeks (his post on `llama.cpp + RPC` being 25x slower told us not to attempt it).
+- [Nous Research](https://github.com/NousResearch/hermes-agent) for the Hermes Agent framework we integrated with.
+- Zheng et al. for the [HALO paper](https://arxiv.org/abs/2601.11676) which clarified that overlap schemes are only marginal in clean LAN regimes.
+
+## Reproducibility checklist
+
+Before declaring success on your own cluster, verify in this order:
+
+1. `objdump -d ~/distributed-llama/dllama | grep -cE 'udot|sdot'` returns more than 200 (Cortex-A76 NEON dotprod kernels were compiled).
+2. `sudo systemctl is-active dllama-api dllama-worker` returns `active` on every node.
+3. `free -h` shows 0 B swap consumption after warm-up on every node.
+4. `vcgencmd measure_temp` returns below 75 deg C under sustained load on every node.
+5. `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` returns `performance` on every node.
+6. `cat /proc/sys/net/ipv4/tcp_congestion_control` returns `bbr` on every node.
+7. `ethtool -c eth0 | grep rx-usecs` returns `10` on every node.
+8. `python3 scripts/benchmark.py` returns 13-14 tok/s mean over 20 runs with standard deviation below 0.15.
+
+If any of these fails, see [`INSTALL.md`](INSTALL.md) for the corresponding fix.
