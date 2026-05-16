@@ -1,0 +1,11 @@
+--- dllama_orig/distributed-llama/src/nn/nn-cpu-ops.hpp	2026-05-16 13:23:14
++++ dllama_patched/src/nn/nn-cpu-ops.hpp	2026-05-15 16:59:27
+@@ -11,7 +11,7 @@
+ 
+ typedef struct {
+     const char *name;
+-    NnByte nBatches;
++    NnUint nBatches;
+     NnByte *bufferFlags;
+     NnByte **buffers;
+     NnBufferConfig *bufferConfigs;

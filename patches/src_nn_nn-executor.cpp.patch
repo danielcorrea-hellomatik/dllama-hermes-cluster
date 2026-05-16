@@ -1,0 +1,37 @@
+--- dllama_orig/distributed-llama/src/nn/nn-executor.cpp	2026-05-16 13:23:14
++++ dllama_patched/src/nn/nn-executor.cpp	2026-05-15 18:45:22
+@@ -1,3 +1,5 @@
++#include <cstdlib>
++#include <stdexcept>
+ #include <cassert>
+ #include <cstring>
+ #include "nn-executor.hpp"
+@@ -6,6 +8,19 @@
+     // Nothing
+ }
+ 
++
++static inline NnByte *alignedAlloc(size_t size) {
++    void *ptr = nullptr;
++    size_t aligned = (size + 63) & ~63;  // round up to 64
++    if (posix_memalign(&ptr, 64, aligned) != 0 || ptr == nullptr)
++        throw std::runtime_error("aligned alloc failed");
++    return (NnByte *)ptr;
++}
++
++static inline void alignedFree(NnByte *p) {
++    free(p);
++}
++
+ NnNetExecution::NnNetExecution(NnUint nThreads, NnNetConfig *netConfig) {
+     this->nThreads = nThreads;
+     this->nBatches = netConfig->nBatches;
+@@ -15,7 +30,7 @@
+     pipes = new NnByte *[netConfig->nPipes];
+     for (NnUint pipeIndex = 0; pipeIndex < netConfig->nPipes; pipeIndex++) {
+         NnPipeConfig *pipeConfig = &netConfig->pipes[pipeIndex];
+-        NnByte *pipe = new NnByte[pipeConfig->size.nBytes];
++        NnByte *pipe = alignedAlloc(pipeConfig->size.nBytes);
+         std::memset(pipe, 0, pipeConfig->size.nBytes);
+         pipes[pipeIndex] = pipe;
+     }

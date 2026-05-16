@@ -1,0 +1,14 @@
+*.o
+*.gcda
+*.gcno
+*.bak
+*.aux
+*.log
+*.out
+*.toc
+__pycache__/
+*.pyc
+.DS_Store
+/tmp/
+*.swp
+models/
